@@ -7,18 +7,21 @@ require("babel-polyfill")
 
 // universal utils: cache, fetch, store, resource, fetcher, router, vdom, etc
 import * as u from 'universal-utils'
+
 const {mount, m, update, store, container, rAF, debounce, qs, router, fetch:_fetch, channel} = u
 
 // the following line, if uncommented, will enable browserify to push
 // a changed file to you, with source maps (reverse map from compiled
 // code line # to source code line #), in realtime via websockets
-if (module.hot) {
-    module.hot.accept()
-    module.hot.dispose(() => {
-        // app()
-        update()
-    })
-}
+
+// Commented out due to potential conflicts with p2p
+// if (module.hot) {
+//     module.hot.accept()
+//     module.hot.dispose(() => {
+//         // app()
+//         update()
+//     })
+// }
 
 var Babel = require('babel-core')
 var presets = [
@@ -75,16 +78,15 @@ const directions = `/* (1) code your JS as normal.
  * */`
 
  // Check for ServiceWorker support before trying to install it
-if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('./serviceworker.js').then(() => {
-    // Registration was successful
-  }).catch(() => {
-    // Registration failed
-  });
-} else {
-  // No ServiceWorker Support
-}
-
+// if ('serviceWorker' in navigator) {
+//   navigator.serviceWorker.register('./serviceworker.js').then(() => {
+//     // Registration was successful
+//   }).catch(() => {
+//     // Registration failed
+//   });
+// } else {
+//   // No ServiceWorker Support
+// }
 let program = unescape(window.location.hash.slice(1)) || `${directions}
 
 let canvas = document.createElement('canvas'),
@@ -102,6 +104,7 @@ c.fillRect(0,0,500,400)
 c.fillStyle = 'white'
 c.fillRect(50,50,20,20)
 `
+program = ''
 
 function prepEnvironment() {
     // Disable Context Menu
@@ -114,6 +117,7 @@ function prepEnvironment() {
         return false
     }
 }
+
 prepEnvironment()
 
 const key = 'AIzaSyC70EBqy70L7fzc19pm_CBczzBxOK-JnhU'
@@ -192,6 +196,8 @@ const prop = (val, onSet) => {
 
 const channels = {
     codeEdited: channel(),
+    codeChanged: channel(),
+    updatePrepared: channel(),
     logEmitted: channel(),
     codeCleared: channel(),
     errorOccurred: channel(),
@@ -327,11 +333,16 @@ channels.codeAnalyzed.spawn(function*(put,take) {
 const TwoPainz = () =>
     m('.grid.grid-2-800', Code, Results)
 
-let editor = null
-const edit = _ =>
+const edit = (cm, change) => {
     channels.codeEdited.spawn(function*(put,take) {
         put(editor.getValue())
     })
+    channels.codeChanged.spawn(function* (put, take) {
+        put(change)
+    })
+}
+
+let editor = null
 
 const Code = () => {
     const config = el => {
@@ -353,6 +364,15 @@ const Code = () => {
         })
         editor.on('change', edit)
         rAF(_ => edit)
+        window.editor = editor
+        channels.updatePrepared.spawn(function* (put, take) {
+            while (true) {
+                let value = take()[1]
+                if (value !== void(0) && value !== null)
+                    editor.setValue(value)
+                yield
+            }
+        })
     }
 
     return m('div', {shouldUpdate: () => 0}, m('textarea', {config}, program))
@@ -422,3 +442,132 @@ const app = () => {
 }
 
 app()
+
+// OT additions
+const io = require('socket.io-client')
+const OTP2PModel = require('ot-p2p-model').OTP2PModel
+const P2P = require('socket.io-p2p')
+const queryString = require('query-string')
+const query = queryString.parse(location.search)
+const socket = io('localhost:3000')
+const model = new OTP2PModel()
+const p2p = new P2P(socket, { trickle: false })
+const peers = new Set()
+
+var suppress = false
+var roomId = query.room
+
+//model.insert(0, program)
+
+const updateModelWithChange = change => {
+    var { from, to, origin } = change
+    var text = change.text.join('\n')
+    var lines = model.get().split('\n')
+    var lengths = lines.map((x, i) => ((i < lines.length - 1) && (lines.length > 1)) ? x.length + 1 : x.length)
+    var pos = [
+        lengths.reduce((a, x, i) => i < from.line ? a + x : a, 0) + from.ch,
+        lengths.reduce((a, x, i) => i < to.line ? a + x : a, 0) + to.ch
+    ];
+
+    switch (origin) {
+        case '+input':
+            model.insert(pos[0], text)
+            break
+        case '+delete':
+            model.delete(pos[0], pos[1] - pos[0])
+            break
+        case 'paste':
+            model.delete(pos[0], pos[1] - pos[0])
+            model.insert(pos[0], text)
+            break
+    }
+}
+
+channels.codeChanged.spawn(function* (put, take) {
+    while (true) {
+        let change = take()[1]
+        // If suppress is `true`, we have already updated the model via remote op.
+        // This doesn't matter currently, because we are using a weaksauce `setValue`
+        // call to update the editor. `setValue` changes have the origin `setValue`,
+        // but soon we will be applying explicit inserts/deletes because `setValue`
+        // causes remote clients' cursors to jump to the start of the editor.
+        if (change && !suppress) {
+            updateModelWithChange(change)
+        }
+        yield
+    }
+})
+
+const sendPeerInit = () =>
+    p2p.emit('peer-msg', {
+        type: 'init',
+        model: model.exportModel(),
+        history: model.exportHistory()
+    })
+
+const updateWithModel = () =>
+    channels.updatePrepared.spawn(function* (put) {
+        yield put(model.get())
+    })
+
+const remoteOp = op => {
+    console.log('consuming op from peer', op)
+    model.remoteOp(op.revision, op.op)
+    console.log(model.get())
+    suppress = true
+    updateWithModel()
+    suppress = false
+}
+
+const handlePeerInit = msg => {
+    model.importModel(msg.model)
+    model.importHistory(msg.history)
+    updateWithModel()
+}
+
+const handleMessage = msg => {
+    switch (msg.type) {
+        case 'op':
+            remoteOp(msg.op)
+            break
+        case 'init':
+            handlePeerInit(msg)
+            break
+    }
+}
+
+socket.on('connect', () => {
+    history.pushState(
+        null,
+        document.title,
+        location.pathname + '?' +
+        queryString.stringify(Object.assign({}, query, { pid: socket.id })) +
+        location.hash
+    )
+
+    if (roomId) {
+        socket.emit('join-room', roomId)
+    } else {
+        socket.emit('create-room', socket.id)
+    }
+})
+
+socket.on('disconnect', () => p2p.disconnect())
+
+model.on('broadcast', op => {
+    console.log('emitting op to peers', op)
+    p2p.emit('peer-msg', { type: 'op', op })
+})
+
+p2p.on('upgrade', () => {
+    p2p.usePeerConnection = true
+    p2p.emit('peer-obj', {
+        peerId: socket.id
+    })
+    if (!roomId)
+        sendPeerInit()
+})
+
+p2p.on('peer-obj', ({ id } = data) => peers.add(id))
+p2p.on('peer-disconnect', ({ id } = data) => peers.delete(id))
+p2p.on('peer-msg', handleMessage)
