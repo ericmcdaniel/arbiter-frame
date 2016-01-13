@@ -78,15 +78,16 @@ const directions = `/* (1) code your JS as normal.
  * */`
 
  // Check for ServiceWorker support before trying to install it
-// if ('serviceWorker' in navigator) {
-//   navigator.serviceWorker.register('./serviceworker.js').then(() => {
-//     // Registration was successful
-//   }).catch(() => {
-//     // Registration failed
-//   });
-// } else {
-//   // No ServiceWorker Support
-// }
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('./serviceworker.js').then(() => {
+    // Registration was successful
+  }).catch(() => {
+    // Registration failed
+  });
+} else {
+  // No ServiceWorker Support
+}
+
 let program = unescape(window.location.hash.slice(1)) || `${directions}
 
 let canvas = document.createElement('canvas'),
