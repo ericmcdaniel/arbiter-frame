@@ -13,15 +13,13 @@ const {mount, m, update, store, container, rAF, debounce, qs, router, fetch:_fet
 // the following line, if uncommented, will enable browserify to push
 // a changed file to you, with source maps (reverse map from compiled
 // code line # to source code line #), in realtime via websockets
-
-// Commented out due to potential conflicts with p2p
-// if (module.hot) {
-//     module.hot.accept()
-//     module.hot.dispose(() => {
-//         // app()
-//         update()
-//     })
-// }
+if (module.hot) {
+    module.hot.accept()
+    module.hot.dispose(() => {
+        // app()
+        update()
+    })
+}
 
 var Babel = require('babel-core')
 var presets = [
