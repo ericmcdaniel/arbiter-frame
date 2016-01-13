@@ -104,7 +104,6 @@ c.fillRect(0,0,500,400)
 c.fillStyle = 'white'
 c.fillRect(50,50,20,20)
 `
-program = ''
 
 function prepEnvironment() {
     // Disable Context Menu
@@ -289,7 +288,7 @@ const analyze = program => {
 
 }
 
-const execCode = //debounce(
+const execCode = debounce(
     transpiled => {
         codeframe.contentWindow.location.reload()
         channels.codeCleared.spawn(function*(put,take) {
@@ -313,7 +312,7 @@ const execCode = //debounce(
             }
         }
     }
-// , 250)
+ , 250)
 
 channels.codeEdited.spawn(function*(put,take) {
     while(true) {
@@ -355,7 +354,8 @@ const Code = () => {
             keyMap: "sublime",
             extraKeys: {
                 "Cmd-S": urlShortener,
-                "Ctrl-S": urlShortener
+                "Ctrl-S": urlShortener,
+                "Ctrl-Space": displayPeerId
             },
             // foldGutter: true,
             inputStyle: "textarea",
@@ -364,7 +364,6 @@ const Code = () => {
         })
         editor.on('change', edit)
         rAF(_ => edit)
-        window.editor = editor
         channels.updatePrepared.spawn(function* (put, take) {
             while (true) {
                 let value = take()[1]
@@ -444,20 +443,42 @@ const app = () => {
 app()
 
 // OT additions
-const io = require('socket.io-client')
+const Peer = require('peerjs')
 const OTP2PModel = require('ot-p2p-model').OTP2PModel
-const P2P = require('socket.io-p2p')
 const queryString = require('query-string')
 const query = queryString.parse(location.search)
-const socket = io('localhost:3000')
-const model = new OTP2PModel()
-const p2p = new P2P(socket, { trickle: false })
+const model = new OTP2PModel(program)
+const p2p = new Peer(query.pid, { host: 'localhost', port: 3000, path: '/ot' });
 const peers = new Set()
 
-var suppress = false
-var roomId = query.room
+const displayPeerId = () => window.prompt('Copy pid to clipboard:', p2p.id)
 
-//model.insert(0, program)
+var suppress = false
+
+function addConn(conn) {
+    conn.on('data', handleMessage)
+    peers.add(conn)
+}
+
+p2p.on('open', id => {
+    history.pushState(
+        null,
+        document.title,
+        location.pathname + '?' +
+        queryString.stringify(Object.assign({}, query, { pid: id })) +
+        location.hash
+    )
+    if (query.room) {
+        let conn = p2p.connect(query.room)
+        conn.on('open', () => addConn(conn))
+    }
+})
+
+p2p.on('connection', conn =>
+    conn.on('open', () => {
+        addConn(conn)
+        sendPeerInit(conn)
+    }))
 
 const updateModelWithChange = change => {
     var { from, to, origin } = change
@@ -498,11 +519,12 @@ channels.codeChanged.spawn(function* (put, take) {
     }
 })
 
-const sendPeerInit = () =>
-    p2p.emit('peer-msg', {
+const sendPeerInit = conn =>
+    conn.send({
         type: 'init',
         model: model.exportModel(),
-        history: model.exportHistory()
+        history: model.exportHistory(),
+        peers: [...peers].map(x => x.peer)
     })
 
 const updateWithModel = () =>
@@ -513,15 +535,21 @@ const updateWithModel = () =>
 const remoteOp = op => {
     console.log('consuming op from peer', op)
     model.remoteOp(op.revision, op.op)
-    console.log(model.get())
     suppress = true
     updateWithModel()
     suppress = false
 }
 
-const handlePeerInit = msg => {
-    model.importModel(msg.model)
-    model.importHistory(msg.history)
+const handlePeerInit = data => {
+    var currIds = new Set([...peers].map(x => x.peer))
+    model.importModel(data.model)
+    model.importHistory(data.history)
+    data.peers
+        .filter(x => !currIds.has(x))
+        .forEach(x => {
+            let conn = p2p.connect(x)
+            conn.on('open', () => addConn(conn))
+        })
     updateWithModel()
 }
 
@@ -536,38 +564,4 @@ const handleMessage = msg => {
     }
 }
 
-socket.on('connect', () => {
-    history.pushState(
-        null,
-        document.title,
-        location.pathname + '?' +
-        queryString.stringify(Object.assign({}, query, { pid: socket.id })) +
-        location.hash
-    )
-
-    if (roomId) {
-        socket.emit('join-room', roomId)
-    } else {
-        socket.emit('create-room', socket.id)
-    }
-})
-
-socket.on('disconnect', () => p2p.disconnect())
-
-model.on('broadcast', op => {
-    console.log('emitting op to peers', op)
-    p2p.emit('peer-msg', { type: 'op', op })
-})
-
-p2p.on('upgrade', () => {
-    p2p.usePeerConnection = true
-    p2p.emit('peer-obj', {
-        peerId: socket.id
-    })
-    if (!roomId)
-        sendPeerInit()
-})
-
-p2p.on('peer-obj', ({ id } = data) => peers.add(id))
-p2p.on('peer-disconnect', ({ id } = data) => peers.delete(id))
-p2p.on('peer-msg', handleMessage)
+model.on('broadcast', (op) => peers.forEach(x => x.send({ type: 'op', op })))
